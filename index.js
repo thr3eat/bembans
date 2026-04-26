@@ -14,7 +14,7 @@ ModalBuilder,
 TextInputBuilder,
 TextInputStyle,
 PermissionFlagsBits,
-} = require(“discord.js”);
+} = require("discord.js");
 require(“dotenv”).config();
 const fs = require(“fs”);
 
