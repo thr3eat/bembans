@@ -707,6 +707,12 @@ console.error(“Appeal kanal mesajı gönderilemedi:”, err);
 client.once(“ready”, () => {
 setTimeout(sendAppealChannelMessage, 3000);
 });
+// index.js'in en altına ekle (client.login'den önce)
+const http = require("http");
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end("Bot aktif!");
+}).listen(process.env.PORT || 3000);
 
 // ============================================================
 //  LOGIN
