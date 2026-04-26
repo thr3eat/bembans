@@ -2,7 +2,6 @@ const {
   Client,
   GatewayIntentBits,
   Partials,
-  Collection,
   REST,
   Routes,
   SlashCommandBuilder,
@@ -22,38 +21,54 @@ const fs = require("fs");
 //  CONFIG
 // ============================================================
 const CONFIG = {
-  // Ana sunucu (ban yönetim sunucusu)
   MAIN_GUILD_ID: "1367646464804655104",
-  // Ban mesajı yönetici kullanıcı ID
   ADMIN_USER_ID: "1031620522406072350",
-  // Ban affı başvuru sunucusu
   APPEAL_GUILD_ID: "1417230761047752817",
-  // Ban affı başvuru kanalı
   APPEAL_CHANNEL_ID: "1417230762616422489",
-  // Ana sunucuda ban affı review kanalı
   REVIEW_CHANNEL_ID: "1498009677743788155",
-  // Ban affı kabul linki
   ACCEPT_INVITE: "https://discord.gg/GPpqAueaCH",
-  // Ban affı başvuru daveti
   APPEAL_INVITE: "https://discord.gg/FMF3sf9h4",
-  // Maksimum ban affı hakkı
   MAX_APPEALS: 2,
+  // DM gönderimi arasındaki bekleme süresi (ms) - rate limit için
+  DM_DELAY: 1000,
 };
 
 // ============================================================
-//  VERİ DEPOLAMA (JSON dosyası)
+//  VERİ DEPOLAMA
 // ============================================================
 const DATA_FILE = "./data.json";
 
 function loadData() {
   if (!fs.existsSync(DATA_FILE)) {
-    fs.writeFileSync(DATA_FILE, JSON.stringify({ bans: {}, appeals: {} }));
+    fs.writeFileSync(
+      DATA_FILE,
+      JSON.stringify({ bans: {}, appeals: {}, logs: [] })
+    );
   }
-  return JSON.parse(fs.readFileSync(DATA_FILE));
+  const raw = JSON.parse(fs.readFileSync(DATA_FILE));
+  if (!raw.logs) raw.logs = [];
+  return raw;
 }
 
 function saveData(data) {
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+}
+
+// Log kaydı ekle
+function addLog(data, type, details) {
+  if (!data.logs) data.logs = [];
+  data.logs.unshift({
+    type,
+    details,
+    timestamp: Date.now(),
+  });
+  // Son 500 logu tut
+  if (data.logs.length > 500) data.logs = data.logs.slice(0, 500);
+}
+
+// Sleep yardımcı fonksiyon
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ============================================================
@@ -71,7 +86,7 @@ const client = new Client({
 });
 
 // ============================================================
-//  SLASH COMMANDS KAYIT
+//  SLASH COMMANDS
 // ============================================================
 const commands = [
   new SlashCommandBuilder()
@@ -88,6 +103,44 @@ const commands = [
       opt
         .setName("ban_id")
         .setDescription("Ban ID numarası")
+        .setRequired(true)
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
+
+  new SlashCommandBuilder()
+    .setName("banlist")
+    .setDescription("Kayıtlı tüm banları listeler.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
+
+  new SlashCommandBuilder()
+    .setName("appeallist")
+    .setDescription("Tüm ban affı başvurularını listeler.")
+    .addStringOption((opt) =>
+      opt
+        .setName("durum")
+        .setDescription("Filtrele: pending / accepted / rejected / all")
+        .setRequired(false)
+        .addChoices(
+          { name: "Bekleyenler", value: "pending" },
+          { name: "Kabul Edilenler", value: "accepted" },
+          { name: "Reddedilenler", value: "rejected" },
+          { name: "Hepsi", value: "all" }
+        )
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
+
+  new SlashCommandBuilder()
+    .setName("istatistik")
+    .setDescription("Bot istatistiklerini gösterir.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
+
+  new SlashCommandBuilder()
+    .setName("appealiptal")
+    .setDescription("Bir kullanıcının tüm ban affı haklarını sıfırlar.")
+    .addStringOption((opt) =>
+      opt
+        .setName("kullanici_id")
+        .setDescription("Kullanıcı Discord ID")
         .setRequired(true)
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
@@ -145,11 +198,31 @@ function buildBanMessageEmbed() {
 }
 
 // ============================================================
+//  DM GÖNDERME YARDIMCI FONKSİYON (hata detaylı)
+// ============================================================
+async function sendDM(userId, payload) {
+  try {
+    const user = await client.users.fetch(userId);
+    await user.send(payload);
+    return { success: true, user };
+  } catch (err) {
+    let reason = "Bilinmeyen hata";
+    if (err.code === 50007) reason = "DM'leri kapalı";
+    else if (err.code === 10013) reason = "Kullanıcı bulunamadı";
+    else if (err.code === 40001) reason = "Yetkilendirme hatası";
+    else if (err.status === 429) reason = "Rate limit - çok hızlı gönderim";
+    else if (err.message) reason = err.message;
+    return { success: false, reason, code: err.code };
+  }
+}
+
+// ============================================================
 //  READY
 // ============================================================
 client.once("ready", async () => {
-  console.log(`✅ Bot aktif: ${client.user.tag}`);
+  console.log(`✅ Bot aktif: ${client.user.username}`);
   await registerCommands();
+  setTimeout(sendAppealChannelMessage, 3000);
 });
 
 // ============================================================
@@ -161,40 +234,58 @@ client.on("guildBanAdd", async (ban) => {
   const data = loadData();
   const userId = ban.user.id;
 
-  // Zaten bu kullanıcıya mesaj gönderildi mi?
   if (data.bans[userId]) return;
 
-  // Ban kaydı oluştur
   const banId = Object.keys(data.bans).length + 1;
   data.bans[userId] = {
     banId,
     userId,
-    tag: ban.user.tag,
+    username: ban.user.username,
     messageSent: false,
     timestamp: Date.now(),
   };
+
+  addLog(data, "BAN_ADD", `${ban.user.username} (${userId}) banlandı. Ban ID: #${banId}`);
   saveData(data);
 
-  // Yetkili kullanıcıya DM gönder
-  try {
-    const admin = await client.users.fetch(CONFIG.ADMIN_USER_ID);
-    const notifyEmbed = new EmbedBuilder()
-      .setColor(0xef4444)
-      .setTitle("🔨 Yeni Ban Algılandı!")
-      .setDescription(
-        [
-          `**Kullanıcı:** ${ban.user.tag} (\`${userId}\`)`,
-          `**Ban ID:** #${banId}`,
-          "",
-          `Ban mesajı göndermek için ana sunucuda şu komutu kullanın:`,
-          `\`/banmesaj ban_id:${banId}\``,
-        ].join("\n")
-      )
-      .setTimestamp();
+  // Admin'e bildir
+  const result = await sendDM(CONFIG.ADMIN_USER_ID, {
+    embeds: [
+      new EmbedBuilder()
+        .setColor(0xef4444)
+        .setTitle("🔨 Yeni Ban Algılandı!")
+        .setDescription(
+          [
+            `**Kullanıcı:** ${ban.user.username} (\`${userId}\`)`,
+            `**Ban ID:** #${banId}`,
+            "",
+            `Ban mesajı göndermek için:`,
+            `\`/banmesaj ban_id:${banId}\``,
+          ].join("\n")
+        )
+        .setTimestamp(),
+    ],
+  });
 
-    await admin.send({ embeds: [notifyEmbed] });
-  } catch (err) {
-    console.error("Admin DM gönderilemedi:", err);
+  if (!result.success) {
+    console.error(`Admin DM gönderilemedi: ${result.reason}`);
+  }
+});
+
+// ============================================================
+//  BAN KALDIRILMA (unban)
+// ============================================================
+client.on("guildBanRemove", async (ban) => {
+  if (ban.guild.id !== CONFIG.MAIN_GUILD_ID) return;
+
+  const data = loadData();
+  const userId = ban.user.id;
+
+  if (data.bans[userId]) {
+    data.bans[userId].unbanned = true;
+    data.bans[userId].unbanTimestamp = Date.now();
+    addLog(data, "BAN_REMOVE", `${ban.user.username} (${userId}) banı kaldırıldı.`);
+    saveData(data);
   }
 });
 
@@ -202,24 +293,35 @@ client.on("guildBanAdd", async (ban) => {
 //  SLASH COMMAND HANDLER
 // ============================================================
 client.on("interactionCreate", async (interaction) => {
+
   // ─── SLASH COMMANDS ───────────────────────────────────────
   if (interaction.isChatInputCommand()) {
-    // /tumbanlananlaramesaj
-    if (interaction.commandName === "tumbanlananlaramesaj") {
-      if (interaction.user.id !== CONFIG.ADMIN_USER_ID) {
-        return interaction.reply({
-          content: "❌ Bu komutu kullanma yetkiniz yok!",
-          ephemeral: true,
-        });
-      }
 
+    // Yetki kontrolü (admin komutları)
+    const adminCommands = ["tumbanlananlaramesaj", "banmesaj", "banlist", "appeallist", "istatistik", "appealiptal"];
+    if (adminCommands.includes(interaction.commandName) && interaction.user.id !== CONFIG.ADMIN_USER_ID) {
+      return interaction.reply({ content: "❌ Bu komutu kullanma yetkiniz yok!", ephemeral: true });
+    }
+
+    // ── /tumbanlananlaramesaj ──────────────────────────────
+    if (interaction.commandName === "tumbanlananlaramesaj") {
       await interaction.deferReply({ ephemeral: true });
 
       const guild = await client.guilds.fetch(CONFIG.MAIN_GUILD_ID);
       const bans = await guild.bans.fetch();
       const data = loadData();
+
       let sent = 0;
       let skipped = 0;
+      let dmClosed = 0;
+      let notFound = 0;
+      let otherError = 0;
+      const errorDetails = [];
+
+      // İlerleme mesajı
+      await interaction.editReply({
+        content: `⏳ İşlem başladı... Toplam **${bans.size}** banlı kullanıcı bulundu.`,
+      });
 
       for (const [userId, banInfo] of bans) {
         if (data.bans[userId]?.messageSent) {
@@ -227,16 +329,15 @@ client.on("interactionCreate", async (interaction) => {
           continue;
         }
 
-        try {
-          const user = await client.users.fetch(userId);
-          await user.send({ embeds: [buildBanMessageEmbed()] });
+        const result = await sendDM(userId, { embeds: [buildBanMessageEmbed()] });
 
+        if (result.success) {
           if (!data.bans[userId]) {
             const banId = Object.keys(data.bans).length + 1;
             data.bans[userId] = {
               banId,
               userId,
-              tag: user.tag,
+              username: result.user.username,
               messageSent: true,
               timestamp: Date.now(),
             };
@@ -244,33 +345,45 @@ client.on("interactionCreate", async (interaction) => {
             data.bans[userId].messageSent = true;
           }
           sent++;
-        } catch {
+        } else {
+          if (result.reason === "DM'leri kapalı") dmClosed++;
+          else if (result.reason === "Kullanıcı bulunamadı") notFound++;
+          else {
+            otherError++;
+            errorDetails.push(`\`${userId}\`: ${result.reason}`);
+          }
           skipped++;
         }
+
+        // Her 5 kullanıcıda bir kaydet
+        if ((sent + skipped) % 5 === 0) saveData(data);
+
+        await sleep(CONFIG.DM_DELAY);
       }
 
       saveData(data);
+      addLog(data, "BULK_DM", `Toplu mesaj: ${sent} gönderildi, ${skipped} atlandı.`);
+      saveData(data);
 
-      return interaction.editReply({
-        content: `✅ **Tamamlandı!**\n📨 Gönderildi: **${sent}** kullanıcı\n⏭️ Atlandı (zaten gönderildi/DM kapalı): **${skipped}** kullanıcı`,
-      });
+      const lines = [
+        `✅ **Tamamlandı!**`,
+        `📨 Gönderildi: **${sent}** kullanıcı`,
+        `⏭️ Zaten gönderilmişti: **${skipped - dmClosed - notFound - otherError}** kullanıcı`,
+        `🔒 DM kapalı: **${dmClosed}** kullanıcı`,
+        `👻 Kullanıcı bulunamadı: **${notFound}** kullanıcı`,
+      ];
+      if (otherError > 0) lines.push(`⚠️ Diğer hata: **${otherError}** kullanıcı`);
+      if (errorDetails.length > 0) lines.push(`\n**Hata detayları:**\n${errorDetails.slice(0, 5).join("\n")}`);
+
+      return interaction.editReply({ content: lines.join("\n") });
     }
 
-    // /banmesaj
+    // ── /banmesaj ─────────────────────────────────────────
     if (interaction.commandName === "banmesaj") {
-      if (interaction.user.id !== CONFIG.ADMIN_USER_ID) {
-        return interaction.reply({
-          content: "❌ Bu komutu kullanma yetkiniz yok!",
-          ephemeral: true,
-        });
-      }
-
       const banId = interaction.options.getInteger("ban_id");
       const data = loadData();
 
-      const banEntry = Object.values(data.bans).find(
-        (b) => b.banId === banId
-      );
+      const banEntry = Object.values(data.bans).find((b) => b.banId === banId);
 
       if (!banEntry) {
         return interaction.reply({
@@ -281,27 +394,145 @@ client.on("interactionCreate", async (interaction) => {
 
       if (banEntry.messageSent) {
         return interaction.reply({
-          content: `⚠️ Bu kullanıcıya zaten ban affı mesajı gönderildi!`,
+          content: `⚠️ Bu kullanıcıya (**${banEntry.username}**) zaten ban affı mesajı gönderildi!`,
           ephemeral: true,
         });
       }
 
       await interaction.deferReply({ ephemeral: true });
 
-      try {
-        const user = await client.users.fetch(banEntry.userId);
-        await user.send({ embeds: [buildBanMessageEmbed()] });
+      const result = await sendDM(banEntry.userId, { embeds: [buildBanMessageEmbed()] });
+
+      if (result.success) {
         data.bans[banEntry.userId].messageSent = true;
+        addLog(data, "DM_SENT", `${banEntry.username} (${banEntry.userId}) ban affı mesajı gönderildi.`);
+        saveData(data);
+        return interaction.editReply({
+          content: `✅ **${result.user.username}** kullanıcısına ban affı mesajı gönderildi!`,
+        });
+      } else {
+        addLog(data, "DM_FAIL", `${banEntry.username} (${banEntry.userId}) DM gönderilemedi: ${result.reason}`);
         saveData(data);
 
-        return interaction.editReply({
-          content: `✅ **${user.tag}** kullanıcısına ban affı mesajı gönderildi!`,
-        });
-      } catch {
-        return interaction.editReply({
-          content: `❌ Kullanıcıya DM gönderilemedi (DM'leri kapalı olabilir).`,
+        let errorMsg = `❌ Kullanıcıya DM gönderilemedi!\n**Sebep:** ${result.reason}`;
+        if (result.code) errorMsg += ` (Kod: ${result.code})`;
+
+        return interaction.editReply({ content: errorMsg });
+      }
+    }
+
+    // ── /banlist ──────────────────────────────────────────
+    if (interaction.commandName === "banlist") {
+      const data = loadData();
+      const bans = Object.values(data.bans);
+
+      if (bans.length === 0) {
+        return interaction.reply({ content: "📋 Kayıtlı ban bulunmuyor.", ephemeral: true });
+      }
+
+      const lines = bans.slice(0, 20).map((b) => {
+        const status = b.messageSent ? "✅" : "❌";
+        const unbanned = b.unbanned ? " *(Banı kaldırıldı)*" : "";
+        return `**#${b.banId}** ${status} \`${b.userId}\` — ${b.username || "Bilinmiyor"}${unbanned}`;
+      });
+
+      const embed = new EmbedBuilder()
+        .setColor(0x6366f1)
+        .setTitle(`📋 Ban Listesi (${bans.length} kayıt)`)
+        .setDescription(lines.join("\n"))
+        .setFooter({ text: "✅ = Mesaj gönderildi | ❌ = Gönderilmedi" })
+        .setTimestamp();
+
+      return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    // ── /appeallist ───────────────────────────────────────
+    if (interaction.commandName === "appeallist") {
+      const data = loadData();
+      const filter = interaction.options.getString("durum") || "pending";
+
+      const allAppeals = [];
+      for (const [uid, appeals] of Object.entries(data.appeals)) {
+        for (const [aid, appeal] of Object.entries(appeals)) {
+          allAppeals.push(appeal);
+        }
+      }
+
+      const filtered = filter === "all"
+        ? allAppeals
+        : allAppeals.filter((a) => a.status === filter);
+
+      if (filtered.length === 0) {
+        return interaction.reply({
+          content: `📋 **${filter}** durumunda başvuru bulunmuyor.`,
+          ephemeral: true,
         });
       }
+
+      const statusEmoji = { pending: "⏳", accepted: "✅", rejected: "❌" };
+      const lines = filtered.slice(0, 15).map((a) => {
+        const emoji = statusEmoji[a.status] || "❓";
+        const date = new Date(a.timestamp).toLocaleDateString("tr-TR");
+        return `${emoji} \`${a.userId}\` — **${a.tag || a.userId}** | ${date} | ${a.appealCount}. başvuru`;
+      });
+
+      const embed = new EmbedBuilder()
+        .setColor(0x3b82f6)
+        .setTitle(`📋 Ban Affı Listesi — ${filter.toUpperCase()} (${filtered.length})`)
+        .setDescription(lines.join("\n"))
+        .setTimestamp();
+
+      return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    // ── /istatistik ───────────────────────────────────────
+    if (interaction.commandName === "istatistik") {
+      const data = loadData();
+      const bans = Object.values(data.bans);
+      const allAppeals = [];
+      for (const appeals of Object.values(data.appeals)) {
+        for (const a of Object.values(appeals)) allAppeals.push(a);
+      }
+
+      const embed = new EmbedBuilder()
+        .setColor(0x10b981)
+        .setTitle("📊 Bot İstatistikleri")
+        .addFields(
+          { name: "🔨 Toplam Ban Kaydı", value: `${bans.length}`, inline: true },
+          { name: "📨 Mesaj Gönderilen", value: `${bans.filter((b) => b.messageSent).length}`, inline: true },
+          { name: "🔓 Banı Kaldırılan", value: `${bans.filter((b) => b.unbanned).length}`, inline: true },
+          { name: "📋 Toplam Başvuru", value: `${allAppeals.length}`, inline: true },
+          { name: "⏳ Bekleyen", value: `${allAppeals.filter((a) => a.status === "pending").length}`, inline: true },
+          { name: "✅ Kabul Edilen", value: `${allAppeals.filter((a) => a.status === "accepted").length}`, inline: true },
+          { name: "❌ Reddedilen", value: `${allAppeals.filter((a) => a.status === "rejected").length}`, inline: true },
+          { name: "⏱️ Bot Uptime", value: `${Math.floor(process.uptime() / 60)} dakika`, inline: true },
+        )
+        .setTimestamp();
+
+      return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    // ── /appealiptal ──────────────────────────────────────
+    if (interaction.commandName === "appealiptal") {
+      const targetId = interaction.options.getString("kullanici_id");
+      const data = loadData();
+
+      if (!data.appeals[targetId] || Object.keys(data.appeals[targetId]).length === 0) {
+        return interaction.reply({
+          content: `❌ \`${targetId}\` ID'li kullanıcının başvurusu bulunamadı!`,
+          ephemeral: true,
+        });
+      }
+
+      const count = Object.keys(data.appeals[targetId]).length;
+      delete data.appeals[targetId];
+      addLog(data, "APPEAL_RESET", `${targetId} kullanıcısının ${count} başvurusu sıfırlandı.`);
+      saveData(data);
+
+      return interaction.reply({
+        content: `✅ \`${targetId}\` kullanıcısının **${count}** başvurusu sıfırlandı. Yeniden başvurabilir.`,
+        ephemeral: true,
+      });
     }
   }
 
@@ -309,13 +540,30 @@ client.on("interactionCreate", async (interaction) => {
   if (interaction.isButton() && interaction.customId === "appeal_apply") {
     const data = loadData();
     const userId = interaction.user.id;
-    const appealCount = data.appeals[userId]
-      ? Object.keys(data.appeals[userId]).length
-      : 0;
+    const userAppeals = data.appeals[userId] || {};
+    const appealCount = Object.keys(userAppeals).length;
+
+    // Zaten kabul edilmiş bir başvurusu var mı?
+    const hasAccepted = Object.values(userAppeals).some((a) => a.status === "accepted");
+    if (hasAccepted) {
+      return interaction.reply({
+        content: "✅ Daha önce ban affınız kabul edildi. Tekrar başvuramazsınız.",
+        ephemeral: true,
+      });
+    }
 
     if (appealCount >= CONFIG.MAX_APPEALS) {
       return interaction.reply({
         content: `❌ Maksimum ban affı hakkınızı (${CONFIG.MAX_APPEALS}) kullandınız!`,
+        ephemeral: true,
+      });
+    }
+
+    // Bekleyen başvurusu var mı?
+    const hasPending = Object.values(userAppeals).some((a) => a.status === "pending");
+    if (hasPending) {
+      return interaction.reply({
+        content: "⏳ Zaten incelenmekte olan bir başvurunuz var! Lütfen sonucu bekleyin.",
         ephemeral: true,
       });
     }
@@ -377,7 +625,6 @@ client.on("interactionCreate", async (interaction) => {
     const banSource = interaction.fields.getTextInputValue("ban_source");
     const banDate = interaction.fields.getTextInputValue("ban_date");
 
-    // Appeal kaydı
     if (!data.appeals[userId]) data.appeals[userId] = {};
     const appealId = `${userId}_${Date.now()}`;
     const appealCount = Object.keys(data.appeals[userId]).length + 1;
@@ -386,7 +633,7 @@ client.on("interactionCreate", async (interaction) => {
       appealId,
       appealCount,
       userId,
-      tag: interaction.user.tag,
+      tag: interaction.user.username,
       robloxName,
       discordName,
       banReason,
@@ -395,53 +642,65 @@ client.on("interactionCreate", async (interaction) => {
       status: "pending",
       timestamp: Date.now(),
     };
+
+    addLog(data, "APPEAL_SUBMIT", `${interaction.user.username} (${userId}) ban affı başvurdu. (#${appealCount})`);
     saveData(data);
 
     // Review kanalına gönder
-    const mainGuild = await client.guilds.fetch(CONFIG.MAIN_GUILD_ID);
-    const reviewChannel = await mainGuild.channels.fetch(CONFIG.REVIEW_CHANNEL_ID);
+    try {
+      const mainGuild = await client.guilds.fetch(CONFIG.MAIN_GUILD_ID);
+      const reviewChannel = await mainGuild.channels.fetch(CONFIG.REVIEW_CHANNEL_ID);
 
-    const reviewEmbed = new EmbedBuilder()
-      .setColor(0x3b82f6)
-      .setTitle("📋 Yeni Ban Affı Başvurusu")
-      .setThumbnail(interaction.user.displayAvatarURL())
-      .addFields(
-        { name: "👤 Discord", value: `${interaction.user.tag} (\`${userId}\`)`, inline: true },
-        { name: "🎮 Roblox İsmi", value: robloxName, inline: true },
-        { name: "📝 Discord İsmi", value: discordName, inline: true },
-        { name: "⛔ Ban Sebebi", value: banReason, inline: false },
-        { name: "📍 Nereden Ban?", value: banSource, inline: true },
-        { name: "📅 Ban Tarihi", value: banDate, inline: true },
-        { name: "🔢 Başvuru No", value: `${appealCount}/${CONFIG.MAX_APPEALS}`, inline: true }
-      )
-      .setFooter({ text: `Appeal ID: ${appealId}` })
-      .setTimestamp();
+      const remainingAfter = CONFIG.MAX_APPEALS - appealCount;
 
-    const actionRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`accept_${appealId}`)
-        .setLabel("✅ Kabul Et")
-        .setStyle(ButtonStyle.Success),
-      new ButtonBuilder()
-        .setCustomId(`reject_${appealId}`)
-        .setLabel("❌ Reddet")
-        .setStyle(ButtonStyle.Danger)
-    );
+      const reviewEmbed = new EmbedBuilder()
+        .setColor(0x3b82f6)
+        .setTitle("📋 Yeni Ban Affı Başvurusu")
+        .setThumbnail(interaction.user.displayAvatarURL())
+        .addFields(
+          { name: "👤 Discord", value: `${interaction.user.username} (\`${userId}\`)`, inline: true },
+          { name: "🎮 Roblox İsmi", value: robloxName, inline: true },
+          { name: "📝 Discord İsmi", value: discordName, inline: true },
+          { name: "⛔ Ban Sebebi", value: banReason, inline: false },
+          { name: "📍 Nereden Ban?", value: banSource, inline: true },
+          { name: "📅 Ban Tarihi", value: banDate, inline: true },
+          {
+            name: "🔢 Başvuru No",
+            value: `${appealCount}/${CONFIG.MAX_APPEALS} (${remainingAfter} hak kaldı)`,
+            inline: true,
+          }
+        )
+        .setFooter({ text: `Appeal ID: ${appealId}` })
+        .setTimestamp();
 
-    await reviewChannel.send({ embeds: [reviewEmbed], components: [actionRow] });
+      const actionRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`accept__${appealId}`)
+          .setLabel("✅ Kabul Et")
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId(`reject__${appealId}`)
+          .setLabel("❌ Reddet")
+          .setStyle(ButtonStyle.Danger)
+      );
+
+      await reviewChannel.send({ embeds: [reviewEmbed], components: [actionRow] });
+    } catch (err) {
+      console.error("Review kanalına gönderilemedi:", err);
+    }
 
     await interaction.reply({
-      content: "✅ Ban affı başvurunuz alındı! Sonuç DM olarak bildirilecektir.",
+      content: `✅ Ban affı başvurunuz alındı! (**${appealCount}/${CONFIG.MAX_APPEALS}** hakkınızı kullandınız)\nSonuç DM olarak bildirilecektir.`,
       ephemeral: true,
     });
   }
 
   // ─── BUTON: Kabul Et ──────────────────────────────────────
-  if (interaction.isButton() && interaction.customId.startsWith("accept_")) {
-    const appealId = interaction.customId.replace("accept_", "");
+  if (interaction.isButton() && interaction.customId.startsWith("accept__")) {
+    const appealId = interaction.customId.slice("accept__".length);
 
     const modal = new ModalBuilder()
-      .setCustomId(`accept_modal_${appealId}`)
+      .setCustomId(`accept_modal__${appealId}`)
       .setTitle("Kabul Etme Sebebi");
 
     modal.addComponents(
@@ -458,11 +717,11 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   // ─── BUTON: Reddet ────────────────────────────────────────
-  if (interaction.isButton() && interaction.customId.startsWith("reject_")) {
-    const appealId = interaction.customId.replace("reject_", "");
+  if (interaction.isButton() && interaction.customId.startsWith("reject__")) {
+    const appealId = interaction.customId.slice("reject__".length);
 
     const modal = new ModalBuilder()
-      .setCustomId(`reject_modal_${appealId}`)
+      .setCustomId(`reject_modal__${appealId}`)
       .setTitle("Red Etme Sebebi");
 
     modal.addComponents(
@@ -481,13 +740,12 @@ client.on("interactionCreate", async (interaction) => {
   // ─── MODAL: Kabul Onayı ───────────────────────────────────
   if (
     interaction.isModalSubmit() &&
-    interaction.customId.startsWith("accept_modal_")
+    interaction.customId.startsWith("accept_modal__")
   ) {
-    const appealId = interaction.customId.replace("accept_modal_", "");
+    const appealId = interaction.customId.slice("accept_modal__".length);
     const reason = interaction.fields.getTextInputValue("accept_reason");
     const data = loadData();
 
-    // Appeal bul
     let targetAppeal = null;
     let targetUserId = null;
     for (const [uid, appeals] of Object.entries(data.appeals)) {
@@ -502,70 +760,93 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.reply({ content: "❌ Başvuru bulunamadı!", ephemeral: true });
     }
 
+    if (targetAppeal.status !== "pending") {
+      return interaction.reply({
+        content: `⚠️ Bu başvuru zaten **${targetAppeal.status}** durumunda!`,
+        ephemeral: true,
+      });
+    }
+
     data.appeals[targetUserId][appealId].status = "accepted";
-    saveData(data);
+    data.appeals[targetUserId][appealId].reviewedBy = interaction.user.username;
+    data.appeals[targetUserId][appealId].reviewReason = reason;
+    data.appeals[targetUserId][appealId].reviewTimestamp = Date.now();
 
     // Ana sunucudan banı kaldır
+    let banRemoved = false;
     try {
       const mainGuild = await client.guilds.fetch(CONFIG.MAIN_GUILD_ID);
       await mainGuild.bans.remove(targetUserId, `Ban affı kabul edildi. Sebep: ${reason}`);
+      banRemoved = true;
     } catch (err) {
-      console.error("Ban kaldırma hatası:", err);
+      console.error("Ban kaldırma hatası:", err.message);
     }
 
     // Kullanıcıya DM
-    try {
-      const user = await client.users.fetch(targetUserId);
-      const acceptEmbed = new EmbedBuilder()
-        .setColor(0x22c55e)
-        .setTitle("✅ Ban Affınız Kabul Edildi!")
-        .setDescription(
-          [
-            `**Tebrikler! Ban affınız kabul edildi.**`,
-            "",
-            `🔗 **Sunucuya Katıl:** ${CONFIG.ACCEPT_INVITE}`,
-            "",
-            `📋 **Sebep:** ${reason}`,
-            "",
-            "💛 Tekrar aramıza hoşgeldiniz!",
-          ].join("\n")
-        )
-        .setTimestamp();
-
-      await user.send({ embeds: [acceptEmbed] });
-    } catch (err) {
-      console.error("Kullanıcıya DM gönderilemedi:", err);
-    }
-
-    // Review mesajını güncelle
-    await interaction.message.edit({
-      components: [
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId("done")
-            .setLabel("✅ Kabul Edildi")
-            .setStyle(ButtonStyle.Success)
-            .setDisabled(true)
-        ),
+    const dmResult = await sendDM(targetUserId, {
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0x22c55e)
+          .setTitle("✅ Ban Affınız Kabul Edildi!")
+          .setDescription(
+            [
+              `**Tebrikler! Ban affınız kabul edildi.**`,
+              "",
+              `🔗 **Sunucuya Katıl:** ${CONFIG.ACCEPT_INVITE}`,
+              "",
+              `📋 **Sebep:** ${reason}`,
+              "",
+              "💛 Tekrar aramıza hoşgeldiniz!",
+            ].join("\n")
+          )
+          .setTimestamp(),
       ],
     });
 
-    await interaction.reply({
-      content: `✅ Ban affı kabul edildi ve kullanıcıya bildirildi!`,
-      ephemeral: true,
-    });
+    addLog(data, "APPEAL_ACCEPT", `${targetUserId} başvurusu kabul edildi. Yetkili: ${interaction.user.username}`);
+    saveData(data);
+
+    // Review mesajını güncelle
+    try {
+      await interaction.message.edit({
+        embeds: [
+          EmbedBuilder.from(interaction.message.embeds[0])
+            .setColor(0x22c55e)
+            .setTitle("📋 Ban Affı Başvurusu — ✅ KABUL EDİLDİ")
+            .addFields({ name: "✅ Kabul Eden", value: interaction.user.username, inline: true }),
+        ],
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId("done_accept")
+              .setLabel("✅ Kabul Edildi")
+              .setStyle(ButtonStyle.Success)
+              .setDisabled(true)
+          ),
+        ],
+      });
+    } catch (err) {
+      console.error("Mesaj güncellenemedi:", err.message);
+    }
+
+    const lines = [`✅ Ban affı kabul edildi!`];
+    if (banRemoved) lines.push(`🔓 Sunucudan ban kaldırıldı.`);
+    else lines.push(`⚠️ Ban kaldırılamadı (kullanıcı zaten unbanned olabilir).`);
+    if (!dmResult.success) lines.push(`⚠️ Kullanıcıya DM gönderilemedi: ${dmResult.reason}`);
+    else lines.push(`📨 Kullanıcıya bildirim DM'i gönderildi.`);
+
+    await interaction.reply({ content: lines.join("\n"), ephemeral: true });
   }
 
   // ─── MODAL: Red Onayı ────────────────────────────────────
   if (
     interaction.isModalSubmit() &&
-    interaction.customId.startsWith("reject_modal_")
+    interaction.customId.startsWith("reject_modal__")
   ) {
-    const appealId = interaction.customId.replace("reject_modal_", "");
+    const appealId = interaction.customId.slice("reject_modal__".length);
     const reason = interaction.fields.getTextInputValue("reject_reason");
     const data = loadData();
 
-    // Appeal bul
     let targetAppeal = null;
     let targetUserId = null;
     for (const [uid, appeals] of Object.entries(data.appeals)) {
@@ -580,59 +861,79 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.reply({ content: "❌ Başvuru bulunamadı!", ephemeral: true });
     }
 
-    data.appeals[targetUserId][appealId].status = "rejected";
-    saveData(data);
+    if (targetAppeal.status !== "pending") {
+      return interaction.reply({
+        content: `⚠️ Bu başvuru zaten **${targetAppeal.status}** durumunda!`,
+        ephemeral: true,
+      });
+    }
 
-    const remainingAppeals =
-      CONFIG.MAX_APPEALS - Object.keys(data.appeals[targetUserId]).length;
+    data.appeals[targetUserId][appealId].status = "rejected";
+    data.appeals[targetUserId][appealId].reviewedBy = interaction.user.username;
+    data.appeals[targetUserId][appealId].reviewReason = reason;
+    data.appeals[targetUserId][appealId].reviewTimestamp = Date.now();
+
+    const totalAppeals = Object.keys(data.appeals[targetUserId]).length;
+    const remainingAppeals = CONFIG.MAX_APPEALS - totalAppeals;
     const isLastAppeal = remainingAppeals <= 0;
 
     // Kullanıcıya DM
-    try {
-      const user = await client.users.fetch(targetUserId);
-      const rejectEmbed = new EmbedBuilder()
-        .setColor(0xef4444)
-        .setTitle("❌ Ban Affınız Reddedildi!")
-        .setDescription(
-          [
-            `**Ban affınız reddedildi.**`,
-            "",
-            `📋 **Sebep:** ${reason}`,
-            "",
-            isLastAppeal
-              ? "⚠️ **Uyarı:** Maksimum ban affı hakkınızı kullandınız. Artık başvuru yapamazsınız."
-              : `🔄 Tekrar ban affı atmayı deneyebilirsiniz.\n⚠️ **Uyarı:** Sadece ${remainingAppeals} ban affı hakkınız kaldı!`,
-          ].join("\n")
-        )
-        .setTimestamp();
-
-      await user.send({ embeds: [rejectEmbed] });
-    } catch (err) {
-      console.error("Kullanıcıya DM gönderilemedi:", err);
-    }
-
-    // Review mesajını güncelle
-    await interaction.message.edit({
-      components: [
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId("done")
-            .setLabel("❌ Reddedildi")
-            .setStyle(ButtonStyle.Danger)
-            .setDisabled(true)
-        ),
+    const dmResult = await sendDM(targetUserId, {
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0xef4444)
+          .setTitle("❌ Ban Affınız Reddedildi!")
+          .setDescription(
+            [
+              `**Ban affınız reddedildi.**`,
+              "",
+              `📋 **Sebep:** ${reason}`,
+              "",
+              isLastAppeal
+                ? "⚠️ **Uyarı:** Maksimum ban affı hakkınızı kullandınız. Artık başvuru yapamazsınız."
+                : `🔄 Tekrar ban affı başvurabilirsiniz.\n⚠️ **Uyarı:** Sadece **${remainingAppeals}** ban affı hakkınız kaldı!`,
+            ].join("\n")
+          )
+          .setTimestamp(),
       ],
     });
 
-    await interaction.reply({
-      content: `✅ Ban affı reddedildi ve kullanıcıya bildirildi!`,
-      ephemeral: true,
-    });
+    addLog(data, "APPEAL_REJECT", `${targetUserId} başvurusu reddedildi. Yetkili: ${interaction.user.username}`);
+    saveData(data);
+
+    // Review mesajını güncelle
+    try {
+      await interaction.message.edit({
+        embeds: [
+          EmbedBuilder.from(interaction.message.embeds[0])
+            .setColor(0xef4444)
+            .setTitle("📋 Ban Affı Başvurusu — ❌ REDDEDİLDİ")
+            .addFields({ name: "❌ Reddeden", value: interaction.user.username, inline: true }),
+        ],
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId("done_reject")
+              .setLabel("❌ Reddedildi")
+              .setStyle(ButtonStyle.Danger)
+              .setDisabled(true)
+          ),
+        ],
+      });
+    } catch (err) {
+      console.error("Mesaj güncellenemedi:", err.message);
+    }
+
+    const lines = [`✅ Ban affı reddedildi!`];
+    if (!dmResult.success) lines.push(`⚠️ Kullanıcıya DM gönderilemedi: ${dmResult.reason}`);
+    else lines.push(`📨 Kullanıcıya bildirim DM'i gönderildi.`);
+
+    await interaction.reply({ content: lines.join("\n"), ephemeral: true });
   }
 });
 
 // ============================================================
-//  APPEAL KANAL MESAJI GÖNDER (Bot başladığında)
+//  APPEAL KANAL MESAJI GÖNDER
 // ============================================================
 async function sendAppealChannelMessage() {
   try {
@@ -657,6 +958,7 @@ async function sendAppealChannelMessage() {
           "```",
           "",
           "⚠️ **Not:** Maksimum 2 kere ban affı başvurabilirsiniz!",
+          "⏳ Bekleyen başvurunuz varken tekrar başvuramazsınız.",
         ].join("\n")
       )
       .setFooter({ text: "Eko Yıldız Ban Affı Sistemi" })
@@ -669,7 +971,6 @@ async function sendAppealChannelMessage() {
         .setStyle(ButtonStyle.Primary)
     );
 
-    // Kanalda zaten mesaj var mı kontrol et
     const messages = await appealChannel.messages.fetch({ limit: 10 });
     const existing = messages.find(
       (m) =>
@@ -688,15 +989,16 @@ async function sendAppealChannelMessage() {
   }
 }
 
-client.once("ready", () => {
-  setTimeout(sendAppealChannelMessage, 3000);
-});
-
+// ============================================================
+//  HTTP SUNUCUSU (uptime için)
+// ============================================================
 const http = require("http");
-http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end("Bot aktif!");
-}).listen(process.env.PORT || 3000);
+http
+  .createServer((req, res) => {
+    res.writeHead(200);
+    res.end("Bot aktif!");
+  })
+  .listen(process.env.PORT || 3000);
 
 // ============================================================
 //  LOGIN
