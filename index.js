@@ -697,7 +697,7 @@ if (!existing) {
 } else {
   console.log("ℹ️ Ban affı mesajı zaten mevcut.");
 }
-```
+
 
 } catch (err) {
 console.error(“Appeal kanal mesajı gönderilemedi:”, err);
