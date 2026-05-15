@@ -2,10 +2,11 @@
   "name": "eko-yildiz-ban-bot",
   "version": "1.0.0",
   "description": "Eko Yıldız Discord Ban Yönetim Botu",
-  "main": "index.js",
+  "license": "MIT",
+  "main": "src/index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js"
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
   },
   "dependencies": {
     "discord.js": "^14.15.3",
